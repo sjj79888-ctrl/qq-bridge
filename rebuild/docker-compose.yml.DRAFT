@@ -1,0 +1,76 @@
+# docker-compose.yml — DRAFT（重建草稿，不是服务器真本）
+# 服务器真本的 compose 文件不在备份里，本文件按记忆与规格重写。
+# 不确定点见 UNCERTAINTIES.md（U03、U30、U31）。
+# 部署前逐项核对，尤其是 NapCat 镜像名与卷挂载。
+
+services:
+  napcat:
+    # DRAFT：镜像名待确认。原服务器 NapCat 容器的镜像名未在备份中。
+    # 候选之一是 mlikiowa/napcat-docker，部署时核对原镜像名与版本，
+    # 不要直接把候选当真。
+    image: mlikiowa/napcat-docker:latest  # TODO(确认): 原镜像名未知，见 U04
+    container_name: napcat
+    restart: unless-stopped
+    ports:
+      # 只绑 127.0.0.1，不对外暴露。
+      - "127.0.0.1:3000:3000"
+    volumes:
+      # DRAFT：卷路径是推测。NapCat 配置与登录态存在这里，重装即丢，
+      # 部署前核对原服务器的实际挂载路径。
+      - ./napcat-data:/app/napcat/config  # TODO(确认): 原挂载路径未知
+    networks:
+      - qq-bridge_default
+    # 注意：绝不能用重启 napcat 容器来“修”登录，重启会丢 QQ 登录态。
+    # 登录过期只能重新扫码（见 NAPCAT-DEPLOY.md）。
+
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: qq-bridge
+    # 服务名必须是 bridge（容器名才是 qq-bridge），重建命令是：
+    # docker compose up -d --build --force-recreate bridge
+    restart: unless-stopped
+    ports:
+      # 只绑 127.0.0.1。NapCat 上报到 bridge 的 /event。
+      - "127.0.0.1:8787:8787"
+    env_file:
+      - .env
+    environment:
+      # 人格嵌在 bridge.py 默认值里，不挂载人格文件（与原版一致）。
+      - STICKER_DIR=/app/stickers
+    # 桥的日志不落盘（原版如此），容器重建后旧日志即丢。
+    # stickers 是 COPY 进镜像的，不挂载；如需热换表情图再议。
+    depends_on:
+      - napcat
+    networks:
+      - qq-bridge_default
+
+  genie:
+    # Genie-TTS 伴生服务，镜像由 ../genie/Dockerfile 建成（genie-tts-xiaoman）。
+    image: genie-tts-xiaoman:latest
+    container_name: genie
+    # 关键改动（相对原版）：原版用 --restart unless-stopped 无限制自启，
+    # 2026-11-06 被怀疑是 2G 内存假死的元凶（重启后 1 分钟内吃满内存）。
+    # 草稿改成 on-failure:3 + 内存上限，避免重蹈覆辙。
+    # 数值是建议值、未经实测（见 U30），最终值等 Torres 定。
+    restart: "on-failure:3"
+    mem_limit: 800m
+    memswap_limit: 800m
+    deploy:
+      resources:
+        limits:
+          memory: 800M
+    ports:
+      # 只绑 127.0.0.1。
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./genie-data:/app/genie-data:ro
+      - ./genie-voice:/app/genie-voice:ro
+    networks:
+      - qq-bridge_default
+
+networks:
+  qq-bridge_default:
+    name: qq-bridge_default
+    driver: bridge
