@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 部署桥就用这个文件：./deploy.sh
 # qq-bridge 一键部署：在服务器上拉下本仓库，进目录跑 ./deploy.sh。
 # 做完的事：生成 .env、解码表情包、启动扫码页、构建并启动 napcat + bridge。
 # 只动 bridge 相关容器，不动服务器上其他东西。
