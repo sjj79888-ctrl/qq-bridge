@@ -1,0 +1,20 @@
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:v4.18.42
+    container_name: napcat
+    hostname: napcat-qq
+    mac_address: 02:42:ac:11:00:02
+    restart: unless-stopped
+    environment:
+      ACCOUNT: "2750579528"
+      NAPCAT_UID: "1000"
+      NAPCAT_GID: "1000"
+      WEBUI_TOKEN: <redacted>
+    ports:
+      - "127.0.0.1:6099:6099"
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - ./data/qq:/app/.config/QQ
+      - ./data/config:/app/napcat/config
+      - ./data/plugins:/app/napcat/plugins

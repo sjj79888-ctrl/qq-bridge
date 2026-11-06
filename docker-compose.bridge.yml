@@ -1,0 +1,23 @@
+# docker-compose.bridge.yml - bridge service only.
+# 必须和主文件合并用，在仓库根目录跑：
+#   sudo docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --build
+# 只用这一个文件会报错（depends_on 的 napcat 只在主文件里定义）。
+# Project name stays qq-bridge (directory name), so the bridge joins the
+# existing qq-bridge_default network and resolves napcat by service name.
+# Do NOT add a napcat service here: napcat is already deployed from
+# docker-compose.yml with its login volumes. Recreating it would risk login.
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: qq-bridge
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    env_file:
+      - .env
+    environment:
+      - STICKER_DIR=/app/stickers
+    depends_on:
+      - napcat

@@ -1,0 +1,25 @@
+# Dockerfile.bridge — 已验证（2026-11-07）：用这个文件打出的镜像 49fc2a4d6603 正在服务器上跑。
+# 桥服务的镜像定义。
+#  1. pip 走清华源（2026-11-05 23:12 改的，默认源只有每秒 10KB 左右）；
+#  2. 只 COPY bridge.py + stickers，不挂载人格文件（人格嵌在代码默认值里）；
+#  3. 服务名是 bridge，容器名是 qq-bridge。
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# pip 走清华源（与原版一致）。构建放后台跑，OrcaTerm 断线杀不掉它。
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PYTHONUNBUFFERED=1
+
+# DRAFT：依赖清单是推测，但已验证可用。edge-tts 是语音必需；
+# 其余逻辑只用标准库。
+RUN pip install --no-cache-dir "edge-tts"
+
+# 只 COPY bridge.py + stickers（与原版一致）。
+COPY bridge.py /app/bridge.py
+COPY stickers /app/stickers
+
+EXPOSE 8787
+
+CMD ["python3", "/app/bridge.py"]
