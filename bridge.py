@@ -92,25 +92,47 @@ VOICE_TRIGGERS = ["说句话", "讲句话", "发语音", "发个语音",
                    "用语音", "语音说", "念给我听", "读给我听"]
 VOICE_MAX_CHARS = 120
 
-# 表情触发：顺序即优先级，先命中先生效（见 U16）。
+# 表情触发：按情感类别匹配，不局限于几个词（2026-11-07 改）。
+# 只看小满回复的情绪（她的情绪驱动表情），不看他发来的消息。
+# 顺序即优先级，先命中先生效。
+# 排除词：文本里有这些词时，对应类别不触发（防误伤子串）。
+# “困难”含“好困”、“笑哭”含“哭了”，不排除会发错表情。
+STICKER_EXCLUSIONS = {
+    "sleep": ["困难"],
+    "sad": ["笑哭"],
+    "happy": ["不同意"],   # “不同意”含“同意”，不能算开心
+}
 STICKER_RULES = [
-    ("sleep", ["晚安", "睡觉", "睡啦", "困了", "好困", "睡了"]),
-    ("shy", ["害羞", "不好意思", "讨厌啦"]),
-    ("pout", ["哼", "生气", "不理你"]),
-    ("sad", ["委屈", "呜呜", "想哭", "难过"]),
-    ("hug", ["抱抱", "抱一下", "抱我", "抱你"]),
-    ("happy", ["嘿嘿", "哈哈", "开心", "好耶", "太好啦"]),
+    ("sleep", ["晚安", "睡觉", "睡啦", "困了", "好困", "睡了", "晚安安", "睡觉觉",
+               "想睡", "犯困", "困死了", "打哈欠", "睡着了", "睡觉了", "晚安啦"]),
+    ("shy", ["害羞", "不好意思", "讨厌啦", "脸红", "害羞死了", "好害羞",
+             "羞羞", "别看我", "捂脸", "羞死了"]),
+    ("pout", ["哼", "生气", "不理你", "讨厌", "烦死了", "气死了", "哼哼",
+              "生气了", "走开", "才不", "就不", "气死我了", "好烦"]),
+    ("sad", ["委屈", "呜呜", "想哭", "难过", "伤心", "眼泪", "哭了", "好难过",
+             "桑心", "emo", "郁闷", "失落", "哭唧唧", "呜呜呜", "难受", "心疼",
+             "想哭哭", "要哭了", "好伤心"]),
+    ("hug", ["抱抱", "抱一下", "抱我", "抱你", "抱紧我", "要抱抱", "求抱抱",
+             "抱一抱", "抱住我", "抱抱我", "抱紧"]),
+    ("happy", ["嘿嘿", "哈哈", "开心", "高兴", "快乐", "好耶", "太好啦", "太好了",
+               "太棒了", "真好", "喜欢", "爱你", "想你", "兴奋", "惊喜", "好开心",
+               "超开心", "哈哈哈", "嘻嘻", "耶", "好喜欢", "开心死了", "好快乐", "笑",
+               # 同意也算开心（2026-11-07：她回“好呀”就是同意，可以发）。
+               "好呀", "好啊", "好的", "好嘞", "好滴", "没问题", "可以呀", "可以啊",
+               "行吧", "嗯嗯", "同意"]),
 ]
+# 2026-11-07 批量接入：7 类共 23 张（抱抱3 睡觉3 开心3 害羞3 看看腿4 生气3 委屈4）。
+# 委屈 4 张走 sad 类（sad 关键词里有“委屈”）；看看腿走下面的 LEGS_POOL，不走这里。
 STICKER_FILES = {
-    "sleep": ["sleep.jpg"],
-    "shy": ["shy.jpg"],
-    "pout": ["pout.jpg"],
-    "sad": ["sad.jpg", "sad2.jpg"],      # 各 50%（见 U21）
-    "hug": ["hug.jpg"],
-    "happy": ["happy.jpg", "happy2.jpg"],  # 各 50%（见 U21）
+    "sleep": ["sleep.jpg", "sleep2.jpg", "sleep3.jpg"],
+    "shy": ["shy.jpg", "shy2.jpg", "shy3.jpg"],
+    "pout": ["pout.jpg", "pout2.jpg", "pout3.jpg"],
+    "sad": ["sad.jpg", "sad2.jpg", "sad3.jpg", "sad4.jpg"],
+    "hug": ["hug.jpg", "hug2.jpg", "hug3.jpg"],  # 三张随机（2026-11-07）
+    "happy": ["happy.jpg", "happy2.jpg", "happy3.jpg"],
 }
 STICKER_DIR = os.environ.get("STICKER_DIR", "/app/stickers")
-LEGS_POOL = ["legs", "legs3", "legs5"]
+LEGS_POOL = ["legs", "legs2", "legs3", "legs4"]  # 2026-11-07：新看看腿 4 张
 LEGS_TRIGGER = "看看腿"
 
 
@@ -125,6 +147,7 @@ def log(*args):
 _sessions = {}          # key -> {"persona": str}
 _history = {}           # key -> [ {"role": "user"/"assistant", "content": str} ]
 _last_sticker_at = {}   # key -> timestamp of last successful sticker send
+_last_sticker_file = {}  # key -> filename of last successful sticker send (2026-11-07: no immediate repeat)
 
 
 def session_key(event):
@@ -216,40 +239,42 @@ def tts_to_base64(text, mom=False):
 
 # --------------------------------------------------------------- stickers -
 
-def pick_sticker(reply_text):
-    """Return a sticker filename for the reply, or None. 先命中先生效（见 U16）。"""
+def pick_sticker(reply_text, last=None):
+    """Return a sticker filename for the reply, or None.
+
+    只按小满回复里的情绪类别匹配，先命中先生效（见 U16）。
+    2026-11-07：不连发同一张——把上次发过的那张从候选里去掉（只剩一张时除外）。
+    """
+    text = reply_text or ""
     for name, keywords in STICKER_RULES:
-        if any(k in reply_text for k in keywords):
-            return random.choice(STICKER_FILES[name])
+        if any(e in text for e in STICKER_EXCLUSIONS.get(name, [])):
+            continue
+        if any(k in text for k in keywords):
+            files = [f for f in STICKER_FILES[name] if f != last]
+            return random.choice(files or STICKER_FILES[name])
     return None
 
 
 def maybe_sticker(key, reply_text):
-    """70% on keyword hit, 12% random otherwise; 60s gap; only successful sends count.
+    """只按情绪命中发：命中必发对应类别里随机一张，无命中不发；60s 间隔；只统计成功发送。
 
+    概率 2026-11-07 03:42 Torres 改：去掉平时 60% 随机，只剩情绪命中 100%。
     随机池与会话键的定义是推测（见 U17/U18）。
     """
     now = time.time()
     if now - _last_sticker_at.get(key, 0) < CFG["sticker_gap_s"]:
         return None
-    hit = pick_sticker(reply_text)
+    hit = pick_sticker(reply_text, _last_sticker_file.get(key))
     if hit is not None:
-        if random.random() >= 0.70:
-            return None
         if os.path.exists(os.path.join(STICKER_DIR, hit)):
             return hit
-        return None
-    if random.random() < 0.12:
-        pool = [f for files in STICKER_FILES.values() for f in files
-                if os.path.exists(os.path.join(STICKER_DIR, f))]
-        if not pool:
-            return None
-        return random.choice(pool)
     return None
 
 
-def mark_sticker_sent(key):
+def mark_sticker_sent(key, filename=None):
     _last_sticker_at[key] = time.time()
+    if filename:
+        _last_sticker_file[key] = filename
 
 
 # ------------------------------------------------------------ OneBot I/O --
@@ -279,8 +304,13 @@ def text_segment(text):
 
 
 def image_segment_file(filename):
-    # 发送方式是推测（见 U19）：按本地文件路径发。
-    return {"type": "image", "data": {"file": os.path.join(STICKER_DIR, filename)}}
+    # 2026-11-07 实测：按路径发 NapCat 报错“文件处理失败：识别URL失败”，
+    # 因为 /app/stickers 只在 bridge 容器里，NapCat 容器没有这个目录。
+    # 改发 base64，NapCat 实测返回 retcode 0、用户收到图。
+    path = os.path.join(STICKER_DIR, filename)
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    return {"type": "image", "data": {"file": "base64://" + data}}
 
 
 def record_segment(filename):
@@ -351,13 +381,15 @@ def handle_event(event):
         if time.time() - _last_sticker_at.get(key, 0) >= CFG["sticker_gap_s"]:
             available = [n for n in LEGS_POOL
                          if os.path.exists(os.path.join(STICKER_DIR, n + ".jpg"))]
+            last_legs = _last_sticker_file.get(key)
+            pool = [n for n in available if n + ".jpg" != last_legs]
             if available:
-                choice = random.choice(available)
+                choice = random.choice(pool or available)
                 target = ("group", event.get("group_id")) if is_group else ("private", sender)
                 resp = send_via_napcat(target[0], target[1],
                                        [image_segment_file(choice + ".jpg")])
-                if resp is not None:
-                    mark_sticker_sent(key)
+                if resp and resp.get("retcode") == 0:
+                    mark_sticker_sent(key, choice + ".jpg")
         # legs 触发后是否还继续走正常回复，未知；草稿按“继续走正常流程”处理。
 
     # 4. 人格切换（触发细节与优先级是推测，见 U12/U13）。
@@ -419,8 +451,8 @@ def handle_event(event):
         if sticker is not None:
             segments.append(image_segment_file(sticker))
             resp = send_via_napcat(target[0], target[1], segments)
-            if resp is not None:
-                mark_sticker_sent(key)
+            if resp and resp.get("retcode") == 0:
+                mark_sticker_sent(key, sticker)
             return True
     send_via_napcat(target[0], target[1], segments)
     return True
