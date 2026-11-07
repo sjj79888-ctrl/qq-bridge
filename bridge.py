@@ -50,8 +50,9 @@ CFG = {
     "tts_voice_mom": get("TTS_VOICE_MOM", "zh-CN-XiaomoNeural"),
     # SparkTTS 克隆音色（2026-11-08 Torres 批准接线）：跑在 Muse 自己的 VM 上，
     # 桥经 localhost.run 隧道调它。URL 是随机分配的，每次隧道重连都会变；
-    # 重连后要把 SPARKTTS_URL 更新成 tunnel_url.txt 里新的地址，否则这里
-    # 永远失败、自动回落 edge-tts。任一为空 = 不用 SparkTTS，行为与原来一样。
+    # 2026-11-08 自动同步：Muse VM 上的看门狗把最新地址推到公开仓库
+    # sjj79888-ctrl/sparktts-url（url.txt），桥启动时和每次调用失败时自动去取，
+    # 这里的 SPARKTTS_URL 只作取不到时的备用。任一为空 = 不用 SparkTTS，行为与原来一样。
     # Token 只放服务器 .env，绝不进仓库。
     "sparktts_url": get("SPARKTTS_URL", "").rstrip("/"),
     "sparktts_token": get("SPARKTTS_TOKEN", ""),
@@ -134,6 +135,9 @@ VOICE_MAX_CHARS = 120
 SPARKTTS_MAX_CHARS = 10
 SPARKTTS_POLL_S = 10
 SPARKTTS_TIMEOUT_S = 300
+SPARKTTS_URL_STORE = "https://raw.githubusercontent.com/sjj79888-ctrl/sparktts-url/main/url.txt"
+SPARKTTS_URL_REFRESH_S = 3600  # re-check the store at most hourly per call
+_sparktts_url_checked = 0.0
 
 # 表情触发：按情感类别匹配，不局限于几个词（2026-11-07 改）。
 # 只看小满回复的情绪（她的情绪驱动表情），不看他发来的消息。
@@ -295,7 +299,38 @@ def tts_to_base64(text, mom=False):
             pass
 
 
-def sparktts_to_base64(text):
+def refresh_sparktts_url(force=False):
+    """Fetch the current tunnel URL from the public sparktts-url repo
+    (updated by the watcher on Muse's VM whenever localhost.run reconnects).
+    Updates CFG["sparktts_url"] if it changed; returns True on change.
+    Never raises; on any failure the .env URL stays as fallback.
+    """
+    global _sparktts_url_checked
+    now = time.time()
+    if not force and now - _sparktts_url_checked < SPARKTTS_URL_REFRESH_S:
+        return False
+    _sparktts_url_checked = now
+    try:
+        req = urllib.request.Request(
+            SPARKTTS_URL_STORE,
+            headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            fresh = resp.read().decode("utf-8").strip().rstrip("/")
+        if fresh.startswith("https://") and fresh.endswith(".lhr.life"):
+            if fresh != CFG["sparktts_url"]:
+                log("sparktts url updated: %s -> %s"
+                    % (CFG["sparktts_url"], fresh))
+                CFG["sparktts_url"] = fresh
+                return True
+        else:
+            log("sparktts url store returned unexpected value:",
+                repr(fresh)[:120])
+    except Exception as e:
+        log("sparktts url refresh failed:", repr(e))
+    return False
+
+
+def sparktts_to_base64(text, _retried=False):
     """Synthesize speech with the SparkTTS clone voice (friend-voice) on
     Muse's own VM, via the localhost.run tunnel; return a OneBot base64://
     ref or None on ANY failure (caller falls back to edge-tts).
@@ -306,15 +341,24 @@ def sparktts_to_base64(text):
     GET /tts/<job_id> every 10 s until 200 audio/wav.
     Only short replies (<= SPARKTTS_MAX_CHARS) come here: long replies
     ramble. Unconfigured (no URL/token) -> None immediately.
+
+    The tunnel URL is random per reconnect; the watcher on Muse's VM
+    publishes the current URL to the public sparktts-url repo, and this
+    function refreshes it from there (throttled, plus once more on a
+    connection error / 502, with one retry). The .env SPARKTTS_URL is
+    only a fallback if that fetch fails.
     """
-    url = CFG["sparktts_url"]
+    refresh_sparktts_url()
     token = CFG["sparktts_token"]
-    if not url or not token:
+    if not token:
         return None
     headers = {"Content-Type": "application/json",
                "X-Auth-Token": token,
                "User-Agent": "Mozilla/5.0"}
     try:
+        url = CFG["sparktts_url"]
+        if not url:
+            return None
         req = urllib.request.Request(
             url + "/tts",
             data=json.dumps({"text": text}).encode("utf-8"), headers=headers)
@@ -325,10 +369,11 @@ def sparktts_to_base64(text):
             log("sparktts: no job_id in response:", repr(job)[:200])
             return None
         t0 = time.time()
+        refreshed = False
         while time.time() - t0 < SPARKTTS_TIMEOUT_S:
             time.sleep(SPARKTTS_POLL_S)
             req = urllib.request.Request(
-                url + "/tts/" + job_id, headers=headers)
+                CFG["sparktts_url"] + "/tts/" + job_id, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     if resp.status == 202:
@@ -337,6 +382,10 @@ def sparktts_to_base64(text):
             except urllib.error.HTTPError as e:
                 if e.code == 202:
                     continue  # still queued/running
+                if e.code in (502, 503, 504) and not refreshed:
+                    refreshed = True
+                    refresh_sparktts_url(force=True)
+                    continue  # retry the poll against the (possibly new) URL
                 log("sparktts poll failed: job %s HTTP %s" % (job_id, e.code))
                 return None
             if not data:
@@ -346,6 +395,13 @@ def sparktts_to_base64(text):
                 % (job_id, len(text), time.time() - t0, len(data)))
             return "base64://" + base64.b64encode(data).decode()
         log("sparktts timeout: job %s, %d chars" % (job_id, len(text)))
+        return None
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        code = getattr(e, "code", None)
+        if code in (None, 502, 503, 504) and not _retried:
+            if refresh_sparktts_url(force=True):
+                return sparktts_to_base64(text, _retried=True)
+        log("sparktts failed:", repr(e))
         return None
     except Exception as e:
         log("sparktts failed:", repr(e))
@@ -985,8 +1041,9 @@ if __name__ == "__main__":
     if CFG["autonomy"]:
         log("bridge autonomy on: qzone daily cap %d, ugc_right %d, max %d chars, no truncation, no schedule"
             % (CFG["qzone_daily_cap"], CFG["qzone_ugc_right"], CFG["qzone_max_chars"]))
+    refresh_sparktts_url(force=True)
     if CFG["sparktts_url"] and CFG["sparktts_token"]:
-        log("sparktts on: %s (short replies <= %d chars, poll timeout %ds)"
+        log("sparktts on: %s (short replies <= %d chars, poll timeout %ds; url auto-syncs from sparktts-url repo)"
             % (CFG["sparktts_url"], SPARKTTS_MAX_CHARS, SPARKTTS_TIMEOUT_S))
     else:
         log("sparktts off: SPARKTTS_URL/SPARKTTS_TOKEN not set, edge-tts only")

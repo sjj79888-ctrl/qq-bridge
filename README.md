@@ -104,8 +104,12 @@ NapCat 的 QQ 会话 2026-11-07 一天掉了四次，最后一次是静默掉线
   自己的 VM 上，桥经 localhost.run 隧道调它（`SPARKTTS_URL` / `SPARKTTS_TOKEN`，
   见 `.env.example`）。失败、超时（轮询 300 秒）、隧道断了，都自动回落 edge-tts；
   edge-tts 再失败就回文字——语音是尽力而为，绝不丢回复。妈妈模式永远 edge-tts。
-- **隧道地址会变**：localhost.run 的 URL 随机分配，每次重连都换新地址。重连后要
-  把服务器 `.env` 里的 `SPARKTTS_URL` 改成新地址（Muse 那边 `tunnel_url.txt`），
-  否则语音一直回落 edge-tts。想固定地址得用 Cloudflare 命名隧道（要 Torres 的
-  Cloudflare 登录），还没搭。
+- **隧道地址自动同步（2026-11-08）**：localhost.run 的 URL 随机分配，每次重连都换新
+  地址。Muse VM 上的看门狗（`sparktts-urlsync.service`）一发现地址变了，就把它推
+  到公开仓库 [`sjj79888-ctrl/sparktts-url`](https://github.com/sjj79888-ctrl/sparktts-url)
+  的 `url.txt`；桥启动时和每次 SparkTTS 调用失败（连接错误/502）时自动去
+  `https://raw.githubusercontent.com/sjj79888-ctrl/sparktts-url/main/url.txt` 取最新
+  地址，取不到才用服务器 `.env` 里的 `SPARKTTS_URL` 备用——不用再手动改配置了。
+  那个公开仓库里只有地址一行，没有口令。想彻底固定地址得用 Cloudflare 命名隧道
+  （要 Torres 的 Cloudflare 登录），还没搭。
 - 长句不走 SparkTTS：28 字曾用 650 秒还啰嗦出 60 秒音频，所以只接 ≤10 字的短回复。
