@@ -268,9 +268,13 @@ def llm_reply(messages):
 # ------------------------------------------------------------------ TTS ---
 
 def clean_for_tts(text):
-    """Strip emoji / stage directions before speaking. 规则是推测（见 U23）。"""
+    """Strip emoji / stage directions before speaking. 规则是推测（见 U23）。
+    2026-11-08 修正：全角（...）也是舞台提示/自发动作备注，合成时不念，
+    否则“好呀（她小声说）”会被念成“好呀她小声说”——计数（_countable_len）
+    本来就不算括号里的字，念出来的文本必须和计数一致。"""
     text = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", "", text)
     text = re.sub(r"[\[\(][^\]\)]*[\]\)]", "", text)
+    text = re.sub(r"（[^）]*）", "", text)
     text = re.sub(r"\*[^*]*\*", "", text)
     return text.strip()
 
