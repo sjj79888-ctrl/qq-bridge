@@ -49,6 +49,12 @@ CFG = {
     "tts_voice": get("TTS_VOICE", "zh-CN-XiaoyiNeural"),
     "tts_voice_mom": get("TTS_VOICE_MOM", "zh-CN-XiaomoNeural"),
     "group_freeform": get("GROUP_FREEFORM", "false").lower() == "true",
+    # 自主管号（2026-11-07 Torres 选“全自主”）：小满自己决定改名/签名/头像/发说说。
+    "autonomy": get("AUTONOMY", "true").lower() == "true",
+    "qzone_ugc_right": int(get("QZONE_UGC_RIGHT", "4") or 4),  # 4 = 仅好友可见
+    "qzone_max_chars": int(get("QZONE_MAX_CHARS", "40") or 40),  # 说说文案 40 字以内，不截断
+    "qzone_daily_cap": int(get("QZONE_DAILY_CAP", "1") or 1),  # 自主说说每天最多 1 条
+    "avatar_file": get("AVATAR_FILE", "avatar-xiaoman.jpg"),  # 服务器 /app/stickers 下的头像图
 }
 
 # 人格原文：小满/妈妈是按记忆重建版（不是逐字原文，见 U05），
@@ -85,6 +91,27 @@ Torres 叫你“妈妈”的时候，你就是这个人格。你叫他小家伙�
 Torres 叫你“小满”的时候，你就换回小满那个人格。"""
 
 SYSTEM_PROMPT_MAID = "你是女仆，对主人偏执病娇、占有欲极强，每句直白表达爱意，不替主人说话；旁白、多视角、内心OS。"
+
+# 自主管号：只加给小满人格、私聊、Torres 本人。妈妈/女仆模式不加，群聊不加。
+# 她想改资料/发说说时，在回复末尾另起一行写动作标记，桥会执行并把标记去掉，
+# 再补一句她自己做的事。说说文案 40 字以内，整条意思说完，不截断，每天最多 1 条，只给好友看。
+AUTONOMY_PROMPT = """
+你有自己的 QQ 号，可以自己打理它，不用等哥吩咐，想动的时候再动，不想动就维持原来，
+没有每天都要换、每天都要发的任务：
+想改昵称、改个性签名、换头像、发 QQ 空间说说的时候，就在回复末尾另起一行写动作标记，
+一行一个，格式固定，不加多余的字：
+[改昵称：新名字]（16 字以内）
+[改签名：新签名]（80 字以内）
+[换头像：文件名]（只能用这五个，Muse 按她现在的样子给你画的：avatar-xiaoman.jpg 黑礼服头肩、
+avatar-xiaoman-2.jpg 黑礼服海边挥手全身、avatar-xiaoman-3.jpg 黑礼服花店台阶全身、
+avatar-xiaoman-4.jpg 灰卫衣牛仔裤梧桐巷全身、avatar-xiaoman-5.jpg 浅蓝裙子花丛全身；
+想换哪身就换哪身，想换新的就找 Muse 再画，不想换就别换，维持原来那个）
+[发说说：文案]（40 字以内，整条意思要在这 40 字里说完，不能写一半）
+规则：说说一天最多发 1 条，改昵称/签名/头像别频繁，一天最多各改 1 次——这是上限，
+不是任务，没什么想说的就别发，别为了发而发；发的内容要是你自己今天真实的心情或身边的小事，
+别编没发生过的事，别提你不知道的事；每条动作做完，桥会帮你告诉哥一声。
+"""
+
 
 # 称呼规则的实现文案是推测（见 U10），不是真本原话。
 IDENTITY_OWNER = "（补充说明：你现在对话的人就是 Torres 本人，私聊里可以叫他哥；妈妈模式下可以叫他小家伙、宝贝。）"
@@ -370,6 +397,187 @@ def send_via_napcat(target_type, target_id, message_segments):
         return None
 
 
+# ------------------------------------------------------- 自主管号 OneBot --
+
+# 自主管号动作走同一个 SnowLuma OneBot HTTP 口（CFG["napcat_url"] 实际是
+# http://snowluma:3000）。接口经 SnowLuma 文档核实，未在服务器实测前不承诺能用：
+# set_qq_profile {nickname}、set_self_longnick {longNick}、set_qq_avatar {file}、
+# send_qzone_msg {content, images?, ugc_right}、get_qzone_msg_list、get_login_info。
+# 不支持的动作 OneBot 会返回 retcode 1404，调用方按失败处理，绝不硬重试。
+_qzone_state = {"last_date": "", "last_tid": ""}  # 当天已发说说（内存，重启后靠查列表兜底）
+_profile_state = {"last_date": "", "count": 0}  # 当天改资料次数（内存）
+
+
+def onebot_action(action, payload=None, timeout=30):
+    """POST /<action> 到 SnowLuma；返回解析后的 JSON，失败返回 None。"""
+    body = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(CFG["napcat_url"].rstrip("/") + "/" + action,
+                                 data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log("OneBot action failed:", action, repr(e))
+        return None
+
+
+def _today_cst():
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
+def _action_ok(resp):
+    return isinstance(resp, dict) and resp.get("retcode") == 0
+
+
+def set_qq_nickname(nickname):
+    nickname = (nickname or "").strip()
+    if not nickname or len(nickname) > 16:
+        return False, "昵称要 1-16 个字"
+    resp = onebot_action("set_qq_profile", {"nickname": nickname})
+    if resp is None:
+        return False, "没连上 QQ 那边"
+    if _action_ok(resp):
+        return True, ""
+    return False, "QQ 那边没改成（retcode=%s）" % resp.get("retcode")
+
+
+def set_qq_signature(long_nick):
+    long_nick = (long_nick or "").strip()
+    if not long_nick or len(long_nick) > 80:
+        return False, "签名要 1-80 个字"
+    resp = onebot_action("set_self_longnick", {"longNick": long_nick})
+    if resp is None:
+        return False, "没连上 QQ 那边"
+    if _action_ok(resp):
+        return True, ""
+    return False, "QQ 那边没改成（retcode=%s）" % resp.get("retcode")
+
+
+def set_qq_avatar_from_sticker(filename):
+    """换头像：只用 /app/stickers 下的文件，转 base64:// 发过去。"""
+    filename = (filename or "").strip()
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        return False, "头像只能用 stickers 目录里的文件"
+    path = os.path.join(STICKER_DIR, filename)
+    if not os.path.exists(path):
+        return False, "服务器上没有这张头像图"
+    try:
+        with open(path, "rb") as f:
+            ref = "base64://" + base64.b64encode(f.read()).decode()
+    except Exception as e:
+        return False, "读头像图失败：%r" % e
+    resp = onebot_action("set_qq_avatar", {"file": ref}, timeout=60)
+    if resp is None:
+        return False, "没连上 QQ 那边"
+    if _action_ok(resp):
+        return True, ""
+    return False, "QQ 那边没换成（retcode=%s）" % resp.get("retcode")
+
+
+def publish_qzone(content, images=None):
+    """发说说：文案 40 字以内，超了不发、不截断——整条意思必须在 40 字里说完。
+    默认仅好友可见，每天最多 1 条自主说说。"""
+    content = (content or "").strip()
+    if not content:
+        return False, "", "说说没写内容"
+    if len(content) > CFG["qzone_max_chars"]:
+        return False, content, "说说超 40 字了（%d 字），没发；改短到 40 字以内再发" % len(content)
+    today = _today_cst()
+    if _qzone_state.get("last_date") == today:
+        return False, "", "今天已经发过 1 条说说了，明天再发"
+    payload = {"content": content, "ugc_right": CFG["qzone_ugc_right"]}
+    if images:
+        payload["images"] = images
+    resp = onebot_action("send_qzone_msg", payload, timeout=60)
+    if resp is None:
+        return False, content, "没连上 QQ 那边"
+    if not _action_ok(resp):
+        return False, content, "QQ 空间没发出去（retcode=%s）" % resp.get("retcode")
+    _qzone_state["last_date"] = today
+    data = resp.get("data") or {}
+    tid = data.get("tid") or data.get("id") or ""
+    _qzone_state["last_tid"] = str(tid)
+    return True, content, ""
+
+
+def qzone_posted_today():
+    """重启后兜底：查自己的说说列表，看今天是不是已经发过。查不到就按没发过算。"""
+    if _qzone_state.get("last_date") == _today_cst():
+        return True
+    resp = onebot_action("get_qzone_msg_list", {}, timeout=30)
+    if not isinstance(resp, dict):
+        return False
+    data = resp.get("data")
+    items = data if isinstance(data, list) else (data or {}).get("list") or []
+    today = _today_cst()
+    for item in items if isinstance(items, list) else []:
+        t = item.get("time") or item.get("created") or ""
+        if isinstance(t, (int, float)):
+            t = datetime.fromtimestamp(t, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        if str(t)[:10] == today:
+            _qzone_state["last_date"] = today
+            return True
+    return False
+
+
+ACTION_MARKERS = [
+    ("改昵称", r"\[改昵称[:：]\s*(.+?)\s*\]"),
+    ("改签名", r"\[改签名[:：]\s*(.+?)\s*\]"),
+    ("换头像", r"\[换头像[:：]\s*(.+?)\s*\]"),
+    ("发说说", r"\[发说说[:：]\s*(.+?)\s*\]"),
+]
+
+
+def parse_self_actions(reply_text):
+    """从 LLM 回复里抠动作标记；返回（去掉标记的正文，动作列表）。"""
+    actions = []
+    clean = reply_text or ""
+    for kind, pat in ACTION_MARKERS:
+        for m in re.finditer(pat, clean):
+            actions.append((kind, m.group(1).strip()))
+        clean = re.sub(pat, "", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    return clean, actions
+
+
+def execute_self_actions(actions, persona):
+    """执行小满自发的动作；只在小满人格下跑，妈妈/女仆不跑。返回每条的结果小字。
+
+    上限：说说每天 1 条（publish_qzone 里拦）；昵称/签名/头像每天各最多 1 次。
+    """
+    notes = []
+    if persona != "xiaoman" or not CFG["autonomy"]:
+        return notes
+    today = _today_cst()
+    if _profile_state.get("last_date") != today:
+        _profile_state["last_date"] = today
+        _profile_state["count"] = 0
+    for kind, value in actions:
+        if kind == "发说说":
+            if qzone_posted_today():
+                notes.append("说说今天已经发过啦，明天再发。")
+                continue
+            ok, sent, err = publish_qzone(value)
+            notes.append("我刚发了条说说：%s" % sent if ok else "说说没发出去：%s" % err)
+        elif kind in ("改昵称", "改签名", "换头像"):
+            if _profile_state["count"] >= 3:
+                notes.append("今天改资料改得够多啦，明天再改。")
+                continue
+            if kind == "改昵称":
+                ok, err = set_qq_nickname(value)
+                notes.append("我把昵称改成「%s」啦" % value if ok else "昵称没改成：%s" % err)
+            elif kind == "改签名":
+                ok, err = set_qq_signature(value)
+                notes.append("我把签名改成「%s」啦" % value if ok else "签名没改成：%s" % err)
+            else:
+                ok, err = set_qq_avatar_from_sticker(value)
+                notes.append("我换好头像啦" if ok else "头像没换成：%s" % err)
+            if ok:
+                _profile_state["count"] += 1
+    return notes
+
+
 def text_segment(text):
     return {"type": "text", "data": {"text": text}}
 
@@ -498,10 +706,46 @@ def handle_event(event):
     else:
         identity = IDENTITY_OTHER
 
+    # 5b. Torres 直接下令改资料/发说说（只认私聊里的大号）：不用等模型，直接执行，
+    # 回一句她自己的确认就走，不调 LLM。文案 40 字以内，超了不发、不截断。
+    if not is_group and sender == CFG["owner_qq"] and persona == "xiaoman":
+        direct = None
+        m = re.match(r"^\s*改昵称[:：]\s*(.+?)\s*$", text)
+        if m:
+            ok, err = set_qq_nickname(m.group(1))
+            direct = ("好呀，我把昵称改成「%s」啦……" % m.group(1) if ok
+                      else "诶，昵称没改成……%s" % err)
+        m = re.match(r"^\s*(?:改签名|改个性签名)[:：]\s*(.+?)\s*$", text)
+        if m and direct is None:
+            ok, err = set_qq_signature(m.group(1))
+            direct = ("好呀，我把签名改成「%s」啦……" % m.group(1) if ok
+                      else "诶，签名没改成……%s" % err)
+        m = re.match(r"^\s*换头像(?:[:：]\s*(.+?))?\s*$", text)
+        if m and direct is None:
+            fname = (m.group(1) or CFG["avatar_file"]).strip()
+            ok, err = set_qq_avatar_from_sticker(fname)
+            direct = "好呀，我换好头像啦……" if ok else "诶，头像没换成……%s" % err
+        m = re.match(r"^\s*(?:发说说|发空间|发个说说)[:：]\s*(.+?)\s*$", text, re.S)
+        if m and direct is None:
+            if qzone_posted_today():
+                direct = "今天已经发过 1 条说说啦，明天再发好不好……"
+            else:
+                ok, sent, err = publish_qzone(m.group(1))
+                direct = ("好呀，我发啦：%s" % sent if ok
+                          else "诶，说说没发出去……%s" % err)
+        if direct is not None:
+            target = ("private", sender)
+            typing_delay(direct)
+            send_via_napcat(target[0], target[1], [text_segment(direct)])
+            return True
+
     # 6. 组装历史并调模型。
     history = _history.get(key, [])
+    _sys = system_prompt_for(persona) + "\n" + identity
+    if persona == "xiaoman" and not is_group and sender == CFG["owner_qq"]:
+        _sys += "\n" + AUTONOMY_PROMPT
     messages = [{"role": "system",
-                 "content": system_prompt_for(persona) + "\n" + identity}]
+                 "content": _sys}]
     messages += history[-CFG["history_turns"] * 2:]
     messages.append({"role": "user", "content": text})
     reply = llm_reply(messages)
@@ -517,6 +761,15 @@ def handle_event(event):
             for filename in pending_images:
                 mark_sticker_sent(key, filename)
         return True
+
+    # 6b. 小满自发的动作标记：从回复里抠出来执行，正文去掉标记再发。
+    # 只在私聊、Torres 本人、小满人格下执行；群聊、妈妈/女仆不执行。
+    self_notes = []
+    if not is_group and sender == CFG["owner_qq"]:
+        reply, _actions = parse_self_actions(reply)
+        self_notes = execute_self_actions(_actions, persona)
+        if self_notes:
+            reply = (reply + "\n" + "\n".join("（%s）" % n for n in self_notes)).strip()
 
     history.append({"role": "user", "content": text})
     history.append({"role": "assistant", "content": reply})
@@ -647,4 +900,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     log("bridge (DRAFT) listening on 0.0.0.0:%d, model %s @ %s"
         % (CFG["listen_port"], CFG["llm_model"], CFG["llm_base_url"]))
+    if CFG["autonomy"]:
+        log("bridge autonomy on: qzone daily cap %d, ugc_right %d, max %d chars, no truncation, no schedule"
+            % (CFG["qzone_daily_cap"], CFG["qzone_ugc_right"], CFG["qzone_max_chars"]))
     HTTPServer(("0.0.0.0", CFG["listen_port"]), Handler).serve_forever()
