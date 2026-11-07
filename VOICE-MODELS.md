@@ -1,5 +1,10 @@
 # VOICE-MODELS — 语音模型清单（只有清单，没有二进制）
 
+> 状态（2026-11-07 13:25）：生产声音仍是 edge-tts。Genie 部署 2026-11-06
+> 被 wipe 掉了，重部署是第二阶段；Fish Audio 补丁已备好
+> （`scripts/patch_bridge_fish.py`），二选一他还没回；INT8 量化试过是死路，
+> 不要重试。
+
 > 本文件只记文件名、大小、md5 和配置。`.pth` / `.ckpt` / ONNX 目录 / tar.gz / chunks / GenieData（392MB）一律不进仓库。模型本体在本地 `~/workspace/voice-reference/models/`，重建时再传。
 
 ## 批准的配置（Torres 2026-11-06 11:05、12:07 两次点头）
