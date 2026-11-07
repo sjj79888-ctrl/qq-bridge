@@ -48,6 +48,13 @@ CFG = {
     "sticker_gap_s": int(get("STICKER_GAP_S", "60") or 60),
     "tts_voice": get("TTS_VOICE", "zh-CN-XiaoyiNeural"),
     "tts_voice_mom": get("TTS_VOICE_MOM", "zh-CN-XiaomoNeural"),
+    # SparkTTS 克隆音色（2026-11-08 Torres 批准接线）：跑在 Muse 自己的 VM 上，
+    # 桥经 localhost.run 隧道调它。URL 是随机分配的，每次隧道重连都会变；
+    # 重连后要把 SPARKTTS_URL 更新成 tunnel_url.txt 里新的地址，否则这里
+    # 永远失败、自动回落 edge-tts。任一为空 = 不用 SparkTTS，行为与原来一样。
+    # Token 只放服务器 .env，绝不进仓库。
+    "sparktts_url": get("SPARKTTS_URL", "").rstrip("/"),
+    "sparktts_token": get("SPARKTTS_TOKEN", ""),
     "group_freeform": get("GROUP_FREEFORM", "false").lower() == "true",
     # 自主管号（2026-11-07 Torres 选“全自主”）：小满自己决定改名/签名/头像/发说说。
     "autonomy": get("AUTONOMY", "true").lower() == "true",
@@ -123,6 +130,10 @@ FALLBACK_REPLY = "嗯……我刚才走神了，你再说一遍好不好？"  # 
 VOICE_TRIGGERS = ["说句话", "讲句话", "发语音", "发个语音",
                    "用语音", "语音说", "念给我听", "读给我听"]
 VOICE_MAX_CHARS = 120
+# SparkTTS 只接短回复：长句合成不稳定（28 字曾用 650 秒还啰嗦出 60 秒音频）。
+SPARKTTS_MAX_CHARS = 10
+SPARKTTS_POLL_S = 10
+SPARKTTS_TIMEOUT_S = 300
 
 # 表情触发：按情感类别匹配，不局限于几个词（2026-11-07 改）。
 # 只看小满回复的情绪（她的情绪驱动表情），不看他发来的消息。
@@ -282,6 +293,63 @@ def tts_to_base64(text, mom=False):
             os.unlink(path)
         except Exception:
             pass
+
+
+def sparktts_to_base64(text):
+    """Synthesize speech with the SparkTTS clone voice (friend-voice) on
+    Muse's own VM, via the localhost.run tunnel; return a OneBot base64://
+    ref or None on ANY failure (caller falls back to edge-tts).
+
+    Job-based API (sync will NOT work: the free tunnel cuts proxied
+    requests at ~60 s, while a short synthesis takes ~30-40 s and a long
+    one far longer): POST /tts -> 202 {"job_id": ...}, then poll
+    GET /tts/<job_id> every 10 s until 200 audio/wav.
+    Only short replies (<= SPARKTTS_MAX_CHARS) come here: long replies
+    ramble. Unconfigured (no URL/token) -> None immediately.
+    """
+    url = CFG["sparktts_url"]
+    token = CFG["sparktts_token"]
+    if not url or not token:
+        return None
+    headers = {"Content-Type": "application/json",
+               "X-Auth-Token": token,
+               "User-Agent": "Mozilla/5.0"}
+    try:
+        req = urllib.request.Request(
+            url + "/tts",
+            data=json.dumps({"text": text}).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            job = json.loads(resp.read().decode("utf-8"))
+        job_id = job.get("job_id")
+        if not job_id:
+            log("sparktts: no job_id in response:", repr(job)[:200])
+            return None
+        t0 = time.time()
+        while time.time() - t0 < SPARKTTS_TIMEOUT_S:
+            time.sleep(SPARKTTS_POLL_S)
+            req = urllib.request.Request(
+                url + "/tts/" + job_id, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    if resp.status == 202:
+                        continue  # still queued/running
+                    data = resp.read()
+            except urllib.error.HTTPError as e:
+                if e.code == 202:
+                    continue  # still queued/running
+                log("sparktts poll failed: job %s HTTP %s" % (job_id, e.code))
+                return None
+            if not data:
+                log("sparktts: empty audio for job %s" % job_id)
+                return None
+            log("sparktts ok: job %s, %d chars, %.0fs, %d bytes"
+                % (job_id, len(text), time.time() - t0, len(data)))
+            return "base64://" + base64.b64encode(data).decode()
+        log("sparktts timeout: job %s, %d chars" % (job_id, len(text)))
+        return None
+    except Exception as e:
+        log("sparktts failed:", repr(e))
+        return None
 
 
 # --------------------------------------------------------------- stickers -
@@ -784,9 +852,19 @@ def handle_event(event):
 
     # 7. 语音：触发词命中且回复 ≤120 字。妈妈模式用 Xiaoxuan；女仆模式不发语音。
     # （女仆模式不发语音是推测：规格只写了女仆不发表情，语音未明说。见 UNCERTAINTIES。）
+    # 2026-11-08：小满人格 + 短回复（≤10 字）先试 SparkTTS 克隆音色，
+    # 妈妈模式永远 edge-tts；SparkTTS 任何失败/超时都回落 edge-tts，
+    # edge-tts 再失败则回文字——语音是尽力而为，绝不丢回复。
     wants_voice = any(t in text for t in VOICE_TRIGGERS)
     if wants_voice and len(reply) <= VOICE_MAX_CHARS and persona != "maid":
-        ref = tts_to_base64(reply, mom=(persona == "mom"))
+        ref = None
+        clean = clean_for_tts(reply)
+        if persona == "xiaoman" and clean and len(clean) <= SPARKTTS_MAX_CHARS:
+            ref = sparktts_to_base64(clean)
+            if ref is None:
+                log("sparktts fallback to edge-tts")
+        if ref is None:
+            ref = tts_to_base64(reply, mom=(persona == "mom"))
         if ref is not None:
             # 语音回复不发表情。
             send_via_napcat(target[0], target[1], [record_segment(ref)])
@@ -907,4 +985,9 @@ if __name__ == "__main__":
     if CFG["autonomy"]:
         log("bridge autonomy on: qzone daily cap %d, ugc_right %d, max %d chars, no truncation, no schedule"
             % (CFG["qzone_daily_cap"], CFG["qzone_ugc_right"], CFG["qzone_max_chars"]))
+    if CFG["sparktts_url"] and CFG["sparktts_token"]:
+        log("sparktts on: %s (short replies <= %d chars, poll timeout %ds)"
+            % (CFG["sparktts_url"], SPARKTTS_MAX_CHARS, SPARKTTS_TIMEOUT_S))
+    else:
+        log("sparktts off: SPARKTTS_URL/SPARKTTS_TOKEN not set, edge-tts only")
     HTTPServer(("0.0.0.0", CFG["listen_port"]), Handler).serve_forever()

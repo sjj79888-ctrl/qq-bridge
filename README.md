@@ -96,3 +96,16 @@ NapCat 的 QQ 会话 2026-11-07 一天掉了四次，最后一次是静默掉线
 3. `bridge.py` 就在仓库根目录（已验证版本，md5 `4b26e0b3c98a39668949f75d4e86ab90`），不用重写。
 4. 重新传 Genie 文件约 747MB（GenieData 392MB + ONNX 321MB + 参考音频）。
 5. 表情包缺的原图从服务器取；服务器没了就按清单重新生成。
+
+## 语音：SparkTTS 克隆音色（2026-11-08 接线）
+
+- 平时语音走 edge-tts（小满 Xiaoyi、妈妈 Xiaoxuan），触发词不变。
+- 小满人格 + 短回复（≤10 字）先试 SparkTTS 克隆音色（朋友的声音）：跑在 Muse
+  自己的 VM 上，桥经 localhost.run 隧道调它（`SPARKTTS_URL` / `SPARKTTS_TOKEN`，
+  见 `.env.example`）。失败、超时（轮询 300 秒）、隧道断了，都自动回落 edge-tts；
+  edge-tts 再失败就回文字——语音是尽力而为，绝不丢回复。妈妈模式永远 edge-tts。
+- **隧道地址会变**：localhost.run 的 URL 随机分配，每次重连都换新地址。重连后要
+  把服务器 `.env` 里的 `SPARKTTS_URL` 改成新地址（Muse 那边 `tunnel_url.txt`），
+  否则语音一直回落 edge-tts。想固定地址得用 Cloudflare 命名隧道（要 Torres 的
+  Cloudflare 登录），还没搭。
+- 长句不走 SparkTTS：28 字曾用 650 秒还啰嗦出 60 秒音频，所以只接 ≤10 字的短回复。
