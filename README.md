@@ -115,8 +115,13 @@ NapCat 的 QQ 会话 2026-11-07 一天掉了四次，最后一次是静默掉线
   的 `url.txt`；桥启动时和每次 SparkTTS 调用失败（连接错误/502）时自动去
   `https://raw.githubusercontent.com/sjj79888-ctrl/sparktts-url/main/url.txt` 取最新
   地址，取不到才用服务器 `.env` 里的 `SPARKTTS_URL` 备用——不用再手动改配置了。
-  那个公开仓库里只有地址一行，没有口令。想彻底固定地址得用 Cloudflare 命名隧道
-  （要 Torres 的 Cloudflare 登录），还没搭。
+- **直连加固（2026-11-08）**：localhost.run 的免费边缘节点本身不稳（2026-11-08
+  一晚 42 次断开，都是对方 502，SSH 还连着），所以桥现在优先走直连：Muse VM 经
+  SSH 反向隧道把服务挂在服务器 docker 网关 `172.18.0.1:18001`，固定地址
+  （`SPARKTTS_DIRECT_URL`，默认就是这个地址）。直连失败时才回落到上面的公共隧道
+  （重新发任务，不是只重轮询），再失败才回落 edge-tts。直连要求服务器上：VM 的
+  ed25519 公钥在 `/home/ubuntu/.ssh/authorized_keys`，`/etc/ssh/sshd_config` 里
+  `GatewayPorts clientspecified`。公共隧道仍在跑，作为备用。
 - 长句不走 SparkTTS：28 字曾用 650 秒还啰嗦出 60 秒音频，所以只接 ≤20 字的短回复
   （自动语音会按标点切成每段 ≤20 字再发；单个无标点超长子句切不断，整段走
   edge-tts 或文字）。
