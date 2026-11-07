@@ -1,11 +1,12 @@
 # docker-compose.bridge.yml - bridge service only.
 # 必须和主文件合并用，在仓库根目录跑：
 #   sudo docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --build
-# 只用这一个文件会报错（depends_on 的 napcat 只在主文件里定义）。
+# 只用这一个文件会报错（depends_on 的 snowluma 只在主文件里定义）。
 # Project name stays qq-bridge (directory name), so the bridge joins the
-# existing qq-bridge_default network and resolves napcat by service name.
-# Do NOT add a napcat service here: napcat is already deployed from
+# existing qq-bridge_default network and resolves snowluma by service name.
+# Do NOT add a snowluma service here: snowluma is already deployed from
 # docker-compose.yml with its login volumes. Recreating it would risk login.
+# 2026-11-07 起 QQ 协议端是 SnowLuma；depends_on 原来是 napcat，已改。
 services:
   bridge:
     build:
@@ -20,4 +21,4 @@ services:
     environment:
       - STICKER_DIR=/app/stickers
     depends_on:
-      - napcat
+      - snowluma

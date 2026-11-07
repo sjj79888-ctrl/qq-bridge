@@ -1,3 +1,10 @@
+# docker-compose.yml - QQ 协议端 + 桥的合并入口。
+# 2026-11-07 起 QQ 协议端是 SnowLuma（默认启动）；NapCat 已停，只留作回退。
+# 两个服务都绑 127.0.0.1:3000，绝对不要同时启动（会端口冲突）。
+# 回退流程：先停 snowluma，再用 --profile napcat 起 napcat，
+# 并把 .env 的 NAPCAT_URL 改回 http://napcat:3000。
+# 密钥说明：WEBUI_TOKEN（NapCat 回退用）和 VNC_PASSWD 都是占位符 <redacted>，
+# deploy.sh 见到占位符会随机生成并写回本文件（真值绝不进仓库）。
 services:
   napcat:
     image: mlikiowa/napcat-docker:v4.18.42
@@ -5,6 +12,8 @@ services:
     hostname: napcat-qq
     mac_address: 02:42:ac:11:00:02
     restart: unless-stopped
+    profiles:
+      - napcat
     environment:
       ACCOUNT: "2750579528"
       NAPCAT_UID: "1000"
@@ -18,3 +27,24 @@ services:
       - ./data/qq:/app/.config/QQ
       - ./data/config:/app/napcat/config
       - ./data/plugins:/app/napcat/plugins
+  snowluma:
+    image: motricseven7/snowluma:v1.14.15@sha256:8b934a2882bdb63f00ec67b97731fe8a8e840409b6ae98ca688618742bd0ef0d
+    container_name: snowluma
+    restart: unless-stopped
+    shm_size: 512m
+    cap_add:
+      - SYS_PTRACE
+    environment:
+      - TZ=Asia/Shanghai
+      - SNOWLUMA_ACCEPT_EULA=1
+      - SNOWLUMA_ACCEPT_PRIVACY=1
+      - VNC_PASSWD=<redacted>
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3001"
+      - "5099:5099"
+      - "6081:6081"
+      - "127.0.0.1:5900:5900"
+    volumes:
+      - ./snowluma-data:/app/data
+      - ./snowluma-config:/app/.config

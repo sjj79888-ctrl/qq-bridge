@@ -1,14 +1,1 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta http-equiv="refresh" content="10">
-<title>小满 QQ 登录扫码</title>
-</head>
-<body style="text-align:center;font-family:sans-serif">
-<h1>小满 QQ 登录扫码</h1>
-<p>用另一台手机的 QQ 扫下面二维码，登录小号 2750579528。页面每 10 秒自动刷新，二维码约 2 分钟过期。</p>
-<img id="qr" src="qrcode.png" alt="QQ 登录二维码" style="max-width:90vw">
-<script>setInterval(function(){document.getElementById('qr').src='qrcode.png?t='+Date.now();},10000);</script>
-</body>
-</html>
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>QQ 登录二维码</title><style>body{margin:0;background:#000}img{width:100%;display:block}</style></head><body><img id="qr" src="qq-qr.png"><script>setInterval(function(){document.getElementById('qr').src='qq-qr.png?t='+Date.now();},10000);</script></body></html>
