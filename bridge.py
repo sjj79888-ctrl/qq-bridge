@@ -134,6 +134,8 @@ STICKER_FILES = {
 STICKER_DIR = os.environ.get("STICKER_DIR", "/app/stickers")
 LEGS_POOL = ["legs", "legs2", "legs3", "legs4"]  # 2026-11-07：新看看腿 4 张
 LEGS_TRIGGER = "看看腿"
+PAZHE_TRIGGER = "趴着"  # 2026-11-07 Torres 新增：单张，跪姿没尾巴版
+PAZHE_FILE = "pazhe.jpg"
 
 
 def log(*args):
@@ -391,6 +393,18 @@ def handle_event(event):
                 if resp and resp.get("retcode") == 0:
                     mark_sticker_sent(key, choice + ".jpg")
         # legs 触发后是否还继续走正常回复，未知；草稿按“继续走正常流程”处理。
+
+    # 3b. 趴着例外：只看大号本人的消息，不看回复文字；单张 pazhe.jpg。
+    # 与 legs 同款规则：仅 1323841589 生效，60s 间隔内只发一次，成功才计时。
+    if sender == CFG["owner_qq"] and PAZHE_TRIGGER in text:
+        if time.time() - _last_sticker_at.get(key, 0) >= CFG["sticker_gap_s"]:
+            if os.path.exists(os.path.join(STICKER_DIR, PAZHE_FILE)):
+                target = ("group", event.get("group_id")) if is_group else ("private", sender)
+                resp = send_via_napcat(target[0], target[1],
+                                       [image_segment_file(PAZHE_FILE)])
+                if resp and resp.get("retcode") == 0:
+                    mark_sticker_sent(key, PAZHE_FILE)
+        # 同 legs，触发后继续走正常流程。
 
     # 4. 人格切换（触发细节与优先级是推测，见 U12/U13）。
     persona = get_persona(key)
