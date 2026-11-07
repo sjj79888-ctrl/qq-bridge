@@ -1,7 +1,6 @@
 # Fish Audio — 云端合成备选
 
-状态：2026-11-07 补丁已备好（`scripts/patch_bridge_fish.py`），还没部署。
-生产声音仍是 edge-tts。Fish 和 Genie 二选一，Torres 还没回。
+状态：已死路（2026-11-07 13:39 服务器实测：api.fish.audio 和 fish.audio 均超时无响应，000）。Torres 2026-11-07 13:41 决定先不装语音系统，继续用 edge-tts。除非服务器网络变化，否则不要重试。补丁 `scripts/patch_bridge_fish.py` 仅作存档。
 
 ## 怎么做
 
