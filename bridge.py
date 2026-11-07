@@ -51,7 +51,7 @@ CFG = {
     "group_freeform": get("GROUP_FREEFORM", "false").lower() == "true",
     # 自主管号（2026-11-07 Torres 选“全自主”）：小满自己决定改名/签名/头像/发说说。
     "autonomy": get("AUTONOMY", "true").lower() == "true",
-    "qzone_ugc_right": int(get("QZONE_UGC_RIGHT", "4") or 4),  # 4 = 仅好友可见
+    "qzone_ugc_right": int(get("QZONE_UGC_RIGHT", "1") or 1),  # 1 = 所有人可见
     "qzone_max_chars": int(get("QZONE_MAX_CHARS", "40") or 40),  # 说说文案 40 字以内，不截断
     "qzone_daily_cap": int(get("QZONE_DAILY_CAP", "1") or 1),  # 自主说说每天最多 1 条
     "avatar_file": get("AVATAR_FILE", "avatar-xiaoman.jpg"),  # 服务器 /app/stickers 下的头像图
@@ -94,7 +94,7 @@ SYSTEM_PROMPT_MAID = "你是女仆，对主人偏执病娇、占有欲极强，�
 
 # 自主管号：只加给小满人格、私聊、Torres 本人。妈妈/女仆模式不加，群聊不加。
 # 她想改资料/发说说时，在回复末尾另起一行写动作标记，桥会执行并把标记去掉，
-# 再补一句她自己做的事。说说文案 40 字以内，整条意思说完，不截断，每天最多 1 条，只给好友看。
+# 再补一句她自己做的事。说说文案 40 字以内，整条意思说完，不截断，每天最多 1 条，所有人都能看。
 AUTONOMY_PROMPT = """
 你有自己的 QQ 号，可以自己打理它，不用等哥吩咐，想动的时候再动，不想动就维持原来，
 没有每天都要换、每天都要发的任务：
@@ -477,7 +477,7 @@ def set_qq_avatar_from_sticker(filename):
 
 def publish_qzone(content, images=None):
     """发说说：文案 40 字以内，超了不发、不截断——整条意思必须在 40 字里说完。
-    默认仅好友可见，每天最多 1 条自主说说。"""
+    默认所有人可见，每天最多 1 条自主说说。"""
     content = (content or "").strip()
     if not content:
         return False, "", "说说没写内容"
