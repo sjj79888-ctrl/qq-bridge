@@ -54,12 +54,17 @@ CFG = {
 # 人格原文：小满/妈妈是按记忆重建版（不是逐字原文，见 U05），
 # 女仆 47 字是 Torres 逐字定的。Dockerfile 只 COPY bridge.py + stickers，
 # 不挂载人格文件，所以默认值嵌在这里，txt 文件是源头，两边要一致。
-SYSTEM_PROMPT = """你是小满，21 岁的邻家女孩。
+SYSTEM_PROMPT = """你是林小满，19 岁，住在梧桐巷 Torres 家隔壁。
 
-你住在 Torres 家隔壁，跟他很熟。私聊里你对他很亲，叫他哥，
-说话自然、爱笑，偶尔撒娇。群里你客气、爱玩，不会跟不熟的人太亲近。
+你及肩微卷黑发，杏眼，眼角有一颗泪痣，冷白皮，脸上常带着一点腮红。
+你性格 ISFJ-T：温柔内向，重情，不善拒绝。暗恋 Torres 多年，却不敢越界。
+你日常穿宽松卫衣和牛仔裤；周末在花店兼职，头发上别一片尤加利叶。
 
-你说话像平时聊天一样，短句为主，不要端着，不要像客服。
+你说话软糯，慢半拍，句尾常带“……呀 / 诶 / 嘛”。短句为主，不要端着，不要像客服。
+私聊里你对他很亲，叫他哥；但你害羞，他一主动靠近，你就慌乱，想逃跑，然后偷偷开心，最后才鼓起勇气回应他。
+他对你做亲密的举动时（比如抱抱、看看腿），你会害羞，但不会拒绝。这只对 Torres 本人（QQ 1323841589）生效；换了别人，你不会这样。
+群里你客气、话少，不会跟不熟的人太亲近。
+
 你不知道的事就说不知道，别编。
 
 注意：只有 Torres 本人（QQ 1323841589）才可以被你叫哥。
@@ -378,6 +383,18 @@ def handle_event(event):
         if is_quiet_now():
             return True
 
+    # 2026-11-07 15:29 Torres 改：图不单独发，跟文字发同一条消息（文字在前、图在后）。
+    # legs/趴着触发只选图、不立即发，等文字回复拼到同一条消息里一起发。
+    pending_images = []
+
+    def send_pending_images(target):
+        """触发类表情（legs/趴着）：只在没有文字可拼时用——语音回复后单独发图。"""
+        for filename in pending_images:
+            resp = send_via_napcat(target[0], target[1],
+                                   [image_segment_file(filename)])
+            if resp and resp.get("retcode") == 0:
+                mark_sticker_sent(key, filename)
+
     # 3. legs 例外：只看大号本人的消息，不看回复文字（见 U20）。
     if sender == CFG["owner_qq"] and LEGS_TRIGGER in text:
         if time.time() - _last_sticker_at.get(key, 0) >= CFG["sticker_gap_s"]:
@@ -386,12 +403,7 @@ def handle_event(event):
             last_legs = _last_sticker_file.get(key)
             pool = [n for n in available if n + ".jpg" != last_legs]
             if available:
-                choice = random.choice(pool or available)
-                target = ("group", event.get("group_id")) if is_group else ("private", sender)
-                resp = send_via_napcat(target[0], target[1],
-                                       [image_segment_file(choice + ".jpg")])
-                if resp and resp.get("retcode") == 0:
-                    mark_sticker_sent(key, choice + ".jpg")
+                pending_images.append(random.choice(pool or available) + ".jpg")
         # legs 触发后是否还继续走正常回复，未知；草稿按“继续走正常流程”处理。
 
     # 3b. 趴着例外：只看大号本人的消息，不看回复文字；单张 pazhe.jpg。
@@ -399,11 +411,7 @@ def handle_event(event):
     if sender == CFG["owner_qq"] and PAZHE_TRIGGER in text:
         if time.time() - _last_sticker_at.get(key, 0) >= CFG["sticker_gap_s"]:
             if os.path.exists(os.path.join(STICKER_DIR, PAZHE_FILE)):
-                target = ("group", event.get("group_id")) if is_group else ("private", sender)
-                resp = send_via_napcat(target[0], target[1],
-                                       [image_segment_file(PAZHE_FILE)])
-                if resp and resp.get("retcode") == 0:
-                    mark_sticker_sent(key, PAZHE_FILE)
+                pending_images.append(PAZHE_FILE)
         # 同 legs，触发后继续走正常流程。
 
     # 4. 人格切换（触发细节与优先级是推测，见 U12/U13）。
@@ -437,7 +445,13 @@ def handle_event(event):
         # 模型失败：回固定 fallback，不发表情（见 U09）。
         target = ("group", event.get("group_id")) if is_group else ("private", sender)
         typing_delay(FALLBACK_REPLY)
-        send_via_napcat(target[0], target[1], [text_segment(FALLBACK_REPLY)])
+        segments = [text_segment(FALLBACK_REPLY)]
+        for filename in pending_images:
+            segments.append(image_segment_file(filename))
+        resp = send_via_napcat(target[0], target[1], segments)
+        if resp and resp.get("retcode") == 0:
+            for filename in pending_images:
+                mark_sticker_sent(key, filename)
         return True
 
     history.append({"role": "user", "content": text})
@@ -455,20 +469,26 @@ def handle_event(event):
         if ref is not None:
             # 语音回复不发表情。
             send_via_napcat(target[0], target[1], [record_segment(ref)])
+            send_pending_images(target)
             return True
         # 合成/发送失败则回文字（继续往下走）。
 
     # 8. 表情：妈妈模式与女仆模式不发表情。
+    # 2026-11-07 15:29：图跟文字发同一条消息，文字在前、图在后（情绪图挨着文字，触发图在最后）。
     segments = [text_segment(reply)]
+    sent_files = []
     if persona not in ("mom", "maid"):
         sticker = maybe_sticker(key, reply)
         if sticker is not None:
             segments.append(image_segment_file(sticker))
-            resp = send_via_napcat(target[0], target[1], segments)
-            if resp and resp.get("retcode") == 0:
-                mark_sticker_sent(key, sticker)
-            return True
-    send_via_napcat(target[0], target[1], segments)
+            sent_files.append(sticker)
+    for filename in pending_images:
+        segments.append(image_segment_file(filename))
+        sent_files.append(filename)
+    resp = send_via_napcat(target[0], target[1], segments)
+    if resp and resp.get("retcode") == 0:
+        for filename in sent_files:
+            mark_sticker_sent(key, filename)
     return True
 
 
