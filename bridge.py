@@ -106,14 +106,21 @@ STICKER_EXCLUSIONS = {
     "sleep": ["困难"],
     "sad": ["笑哭"],
     "happy": ["不同意"],   # “不同意”含“同意”，不能算开心
+    # 2026-11-07 20:11 修复：否定句里的“生气”不是生气（“我没生气”“怎么会生气”），
+    # 有这些词时整句不触发 pout，免得越解释越像生气。
+    "pout": ["没生气", "不生气", "没有生气", "怎么会生气", "不是生气"],
 }
 STICKER_RULES = [
     ("sleep", ["晚安", "睡觉", "睡啦", "困了", "好困", "睡了", "晚安安", "睡觉觉",
                "想睡", "犯困", "困死了", "打哈欠", "睡着了", "睡觉了", "晚安啦"]),
     ("shy", ["害羞", "不好意思", "讨厌啦", "脸红", "害羞死了", "好害羞",
-             "羞羞", "别看我", "捂脸", "羞死了"]),
+             "羞羞", "别看我", "捂脸", "羞死了", "心跳"]),
+    # 2026-11-07 20:14 Torres 纠正：“心跳太快了”不是开心，是害羞。
+    # “心跳”归害羞，且 shy 在 happy 前面，含心跳时优先害羞。
     ("pout", ["哼", "生气", "不理你", "讨厌", "烦死了", "气死了", "哼哼",
-              "生气了", "走开", "才不", "就不", "气死我了", "好烦"]),
+              "生气了", "走开", "气死我了", "好烦"]),
+    # 2026-11-07 20:11：删掉“才不”“就不”——“我就不打扰你了”这种中性句
+    # 也含“就不”，会误判成生气。真生气靠“哼/生气/不理你”就够了。
     ("sad", ["委屈", "呜呜", "想哭", "难过", "伤心", "眼泪", "哭了", "好难过",
              "桑心", "emo", "郁闷", "失落", "哭唧唧", "呜呜呜", "难受", "心疼",
              "想哭哭", "要哭了", "好伤心"]),
@@ -121,7 +128,9 @@ STICKER_RULES = [
              "抱一抱", "抱住我", "抱抱我", "抱紧"]),
     ("happy", ["嘿嘿", "哈哈", "开心", "高兴", "快乐", "好耶", "太好啦", "太好了",
                "太棒了", "真好", "喜欢", "爱你", "想你", "兴奋", "惊喜", "好开心",
-               "超开心", "哈哈哈", "嘻嘻", "耶", "好喜欢", "开心死了", "好快乐", "笑",
+               "超开心", "哈哈哈", "嘻嘻", "耶", "好喜欢", "开心死了", "好快乐",
+               # 2026-11-07 20:11：删掉单字“笑”——“你别笑我嘛”也含“笑”，
+               # 会把“别笑我”误判成开心。开心靠“哈哈/开心/高兴”就够了。
                # 同意也算开心（2026-11-07：她回“好呀”就是同意，可以发）。
                "好呀", "好啊", "好的", "好嘞", "好滴", "没问题", "可以呀", "可以啊",
                "行吧", "嗯嗯", "同意"]),
@@ -181,10 +190,10 @@ def system_prompt_for(persona):
 
 # ------------------------------------------------------------------ LLM ---
 
-def llm_reply(messages):
+def _llm_chat(messages, timeout=60):
     """Call the OpenAI-compatible backend; return reply text or None on failure.
 
-    请求形态是推测（见 U07）：无 temperature、无 max_tokens、无重试、60 秒超时。
+    请求形态是推测（见 U07）：无 temperature、无 max_tokens、无重试。
     """
     url = CFG["llm_base_url"].rstrip("/") + "/chat/completions"
     payload = json.dumps({
@@ -199,12 +208,16 @@ def llm_reply(messages):
                  # 故用浏览器 UA。真本是否如此，未知（见 U07）。
                  "User-Agent": "Mozilla/5.0"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         log("LLM call failed:", repr(e))
         return None
+
+
+def llm_reply(messages):
+    return _llm_chat(messages, timeout=60)
 
 
 # ------------------------------------------------------------------ TTS ---
@@ -262,8 +275,49 @@ def pick_sticker(reply_text, last=None):
     return None
 
 
-def maybe_sticker(key, reply_text):
-    """只按情绪命中发：命中必发对应类别里随机一张，无命中不发；60s 间隔；只统计成功发送。
+# 2026-11-07 20:15 Torres 立的规矩：表情要按整句话的意思判，不能只抠一个词。
+# 所以选图先走 LLM 判情绪：同时看他说的那句和她回的那句，理解整句意思再定；
+# 关键词规则（pick_sticker）只在判情绪失败（模型挂了/返回看不懂）时兜底。
+EMOTION_SYSTEM = (
+    "你是一个情绪判断器。看下面一段对话，判断女生回复时真正的情绪，"
+    "只返回一个词，不要解释，不要多余的字。\n"
+    "可选的词：sleep（困了想睡）、shy（害羞紧张）、pout（生气闹别扭）、"
+    "sad（委屈难过）、hug（想要抱抱）、happy（开心高兴）、none（没有明显情绪）。\n"
+    "判断看整句话的意思，不是单个词：\n"
+    "1. 否定句不算它否定的情绪，比如“我没生气”“怎么会生气”不是 pout，"
+    "“我就不打扰你了”不是 pout，“你别笑我嘛”不是 happy。\n"
+    "2. “心跳好快”“心跳太快了”“心跳加速”是 shy，不是 happy——"
+    "就算她说了“高兴还来不及”，只要整句是紧张得心跳加速，就是 shy。\n"
+    "3. 只有她真的在生气、闹别扭（比如“哼，不理你了”）才是 pout；"
+    "只有她真的开心大笑才是 happy。\n"
+    "4. 拿不准、情绪不明显时返回 none。"
+)
+EMOTION_ALIASES = {
+    "sleep": "sleep", "睡觉": "sleep", "困": "sleep",
+    "shy": "shy", "害羞": "shy", "紧张": "shy",
+    "pout": "pout", "生气": "pout",
+    "sad": "sad", "委屈": "sad", "难过": "sad",
+    "hug": "hug", "抱抱": "hug",
+    "happy": "happy", "开心": "happy", "高兴": "happy",
+    "none": None, "无": None, "没有": None,
+}
+
+
+def classify_emotion(user_text, reply_text):
+    """LLM 按整句意思判她回复的情绪；失败或看不懂返回 None，走关键词兜底。"""
+    out = _llm_chat([
+        {"role": "system", "content": EMOTION_SYSTEM},
+        {"role": "user",
+         "content": "他说：%s\n她回：%s" % (user_text or "", reply_text or "")},
+    ], timeout=15)
+    if not out:
+        return None
+    token = out.strip().split()[0].strip("。,.!！、\"'").lower()
+    return EMOTION_ALIASES.get(token)
+
+
+def maybe_sticker(key, reply_text, user_text=""):
+    """表情选择：先 LLM 按整句意思判情绪，判不出才走关键词兜底；60s 间隔；只统计成功发送。
 
     概率 2026-11-07 03:42 Torres 改：去掉平时 60% 随机，只剩情绪命中 100%。
     随机池与会话键的定义是推测（见 U17/U18）。
@@ -271,9 +325,19 @@ def maybe_sticker(key, reply_text):
     now = time.time()
     if now - _last_sticker_at.get(key, 0) < CFG["sticker_gap_s"]:
         return None
-    hit = pick_sticker(reply_text, _last_sticker_file.get(key))
+    last = _last_sticker_file.get(key)
+    label = classify_emotion(user_text, reply_text)
+    if label in STICKER_FILES:
+        files = [f for f in STICKER_FILES[label] if f != last]
+        hit = random.choice(files or STICKER_FILES[label])
+        if os.path.exists(os.path.join(STICKER_DIR, hit)):
+            log("sticker judge:", label, hit)
+            return hit
+        return None
+    hit = pick_sticker(reply_text, last)
     if hit is not None:
         if os.path.exists(os.path.join(STICKER_DIR, hit)):
+            log("sticker fallback:", hit)
             return hit
     return None
 
@@ -478,7 +542,7 @@ def handle_event(event):
     segments = [text_segment(reply)]
     sent_files = []
     if persona not in ("mom", "maid"):
-        sticker = maybe_sticker(key, reply)
+        sticker = maybe_sticker(key, reply, text)
         if sticker is not None:
             segments.append(image_segment_file(sticker))
             sent_files.append(sticker)
