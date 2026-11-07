@@ -132,7 +132,10 @@ VOICE_TRIGGERS = ["说句话", "讲句话", "发语音", "发个语音",
                    "用语音", "语音说", "念给我听", "读给我听"]
 VOICE_MAX_CHARS = 120
 # SparkTTS 只接短回复：长句合成不稳定（28 字曾用 650 秒还啰嗦出 60 秒音频）。
-SPARKTTS_MAX_CHARS = 10
+# 2026-11-08 自动语音：回 Torres 本人时每段 ≤20 字（括号里的字不算），
+# 超长按标点分段发，所以上限从 10 改成 20。
+SPARKTTS_MAX_CHARS = 20
+AUTO_VOICE_GAP_S = 5  # 自动语音分段发送时，两段之间固定等 5 秒
 SPARKTTS_POLL_S = 10
 SPARKTTS_TIMEOUT_S = 300
 SPARKTTS_URL_STORE = "https://raw.githubusercontent.com/sjj79888-ctrl/sparktts-url/main/url.txt"
@@ -270,6 +273,67 @@ def clean_for_tts(text):
     text = re.sub(r"[\[\(][^\]\)]*[\]\)]", "", text)
     text = re.sub(r"\*[^*]*\*", "", text)
     return text.strip()
+
+
+def _countable_len(text):
+    """可数字数：括号里的字不算。clean_for_tts 已去掉半角 ()、[]、** 和
+    emoji；这里再去掉全角（...）——自发动作备注就是这种格式。"""
+    t = clean_for_tts(text)
+    t = re.sub(r"（[^）]*）", "", t)
+    return len(t.strip())
+
+
+def _split_at(text, punct_pattern):
+    """按标点切成子句，标点留在子句末尾；无标点的整段原样返回。"""
+    parts = re.findall(r".*?(?:%s|$)" % punct_pattern, text, re.S)
+    return [p for p in parts if p]
+
+
+# 句子标点（含省略号整体、换行）
+_SENTENCE_PUNCT = r"(?:……|[。！？；，、：\n])"
+# 句内标点：单个子句太长时再切一刀用的
+_INNER_PUNCT = r"[，、：]"
+
+
+def split_reply_for_voice(reply):
+    """把回复按标点切成每段可数 ≤20 字的片段（括号里的字不算）。
+    返回 [(raw, speak, spark_ok), ...]：
+    - raw：原文本（括号备注保留），语音失败回文字时发这段；
+    - speak：clean_for_tts 后的可说文本；
+    - spark_ok：False 表示这段是单个无标点超长子句，切不断——
+      绝不走 SparkTTS，只走 edge-tts（≤120 字）或文字。
+    切分只发生在标点处，绝不在句中掐断。
+    """
+    segments = []
+    cur = ""
+
+    def flush():
+        nonlocal cur
+        if cur:
+            segments.append((cur, clean_for_tts(cur).strip(), True))
+            cur = ""
+
+    for clause in _split_at(reply, _SENTENCE_PUNCT):
+        if _countable_len(cur + clause) <= SPARKTTS_MAX_CHARS:
+            cur += clause
+            continue
+        flush()
+        if _countable_len(clause) <= SPARKTTS_MAX_CHARS:
+            cur = clause
+            continue
+        # 单个子句就超 20 字：按句内标点（，、：）再切。
+        for sub in _split_at(clause, _INNER_PUNCT):
+            if _countable_len(cur + sub) <= SPARKTTS_MAX_CHARS:
+                cur += sub
+                continue
+            flush()
+            if _countable_len(sub) <= SPARKTTS_MAX_CHARS:
+                cur = sub
+            else:
+                # 句内也没有标点可切：整段保留，绝不掐断，不走 SparkTTS。
+                segments.append((sub, clean_for_tts(sub).strip(), False))
+    flush()
+    return segments
 
 
 def tts_to_base64(text, mom=False):
@@ -906,16 +970,53 @@ def handle_event(event):
     target = ("group", event.get("group_id")) if is_group else ("private", sender)
     typing_delay(reply)
 
-    # 7. 语音：触发词命中且回复 ≤120 字。妈妈模式用 Xiaoxuan；女仆模式不发语音。
+    # 7. 语音。
+    # 7a. 自动语音（2026-11-08，Torres 定）：回 Torres 本人 + 小满人格时，
+    #     回复按 20 字（括号里的字不算）自动发语音，不用触发词；超长按标点
+    #     分段，每段之间固定等 5 秒；语音代替文字。朋友的克隆音色只对 Torres
+    #     生效——回别人的、妈妈/女仆模式，全部走原来的流程。
+    if sender == CFG["owner_qq"] and persona == "xiaoman":
+        segs = split_reply_for_voice(reply)
+        log("auto-voice: sender=%s persona=%s counted=%d segments=%d"
+            % (sender, persona, _countable_len(reply), len(segs)))
+        if segs:
+            for i, (raw, speak, spark_ok) in enumerate(segs):
+                if i > 0:
+                    time.sleep(AUTO_VOICE_GAP_S)
+                ref = None
+                if speak and spark_ok:
+                    ref = sparktts_to_base64(speak)
+                    if ref is None:
+                        log("auto-voice segment %d: sparktts fallback to edge-tts"
+                            % (i + 1))
+                if ref is None and speak and len(speak) <= VOICE_MAX_CHARS:
+                    ref = tts_to_base64(speak, mom=False)
+                if ref is not None:
+                    send_via_napcat(target[0], target[1], [record_segment(ref)])
+                    log("auto-voice segment %d/%d: voice sent (spark_ok=%s)"
+                        % (i + 1, len(segs), spark_ok))
+                else:
+                    # 合成失败或没可说内容：这段回文字，绝不丢回复。
+                    send_via_napcat(target[0], target[1], [text_segment(raw)])
+                    log("auto-voice segment %d/%d: text fallback (spark_ok=%s)"
+                        % (i + 1, len(segs), spark_ok))
+            # 语音回复不发表情；触发类图片（legs/趴着）照旧单独发。
+            send_pending_images(target)
+            return True
+        # 分段为空（回复是空串）：落回原来的文字流程。
+
+    # 7b. 触发语音：触发词命中且回复 ≤120 字。妈妈模式用 Xiaoxuan；女仆模式不发语音。
     # （女仆模式不发语音是推测：规格只写了女仆不发表情，语音未明说。见 UNCERTAINTIES。）
-    # 2026-11-08：小满人格 + 短回复（≤10 字）先试 SparkTTS 克隆音色，
+    # 2026-11-08：小满人格 + 短回复（≤20 字）先试 SparkTTS 克隆音色，
     # 妈妈模式永远 edge-tts；SparkTTS 任何失败/超时都回落 edge-tts，
     # edge-tts 再失败则回文字——语音是尽力而为，绝不丢回复。
+    # 克隆音色只对 Torres 本人：别人触发语音时只走 edge-tts。
     wants_voice = any(t in text for t in VOICE_TRIGGERS)
     if wants_voice and len(reply) <= VOICE_MAX_CHARS and persona != "maid":
         ref = None
         clean = clean_for_tts(reply)
-        if persona == "xiaoman" and clean and len(clean) <= SPARKTTS_MAX_CHARS:
+        if (persona == "xiaoman" and sender == CFG["owner_qq"]
+                and clean and len(clean) <= SPARKTTS_MAX_CHARS):
             ref = sparktts_to_base64(clean)
             if ref is None:
                 log("sparktts fallback to edge-tts")
