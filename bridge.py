@@ -886,8 +886,23 @@ def handle_event(event):
 
     # 2026-11-07 15:29 Torres 改：图不单独发，跟文字发同一条消息（文字在前、图在后）。
     # legs/趴着触发只选图、不立即发，等文字回复拼到同一条消息里一起发。
-    # 2026-11-09 Torres 定：语音回复不发表情，触发类图片也不发（pending_images 只拼文字回复）。
+    # 2026-11-09 Torres 定：发语音也发对应的表情包——语音之后单独发情绪图，再发触发类图片。
     pending_images = []
+
+    def send_voice_images(target, reply_text, user_text, persona_now):
+        """语音回复后单独发表情：先发情绪图（按回复判情绪，中性不发，60 秒内只发一次），
+        再发触发类图片（legs/趴着）。妈妈/女仆模式不发情绪图。"""
+        files = []
+        if persona_now == "xiaoman":
+            sticker = maybe_sticker(key, reply_text, user_text)
+            if sticker is not None:
+                files.append(sticker)
+        files.extend(pending_images)
+        for filename in files:
+            resp = send_via_napcat(target[0], target[1],
+                                   [image_segment_file(filename)])
+            if resp and resp.get("retcode") == 0:
+                mark_sticker_sent(key, filename)
 
     # 3. legs 例外：只看大号本人的消息，不看回复文字（见 U20）。
     if sender == CFG["owner_qq"] and LEGS_TRIGGER in text:
@@ -1030,7 +1045,8 @@ def handle_event(event):
                     send_via_napcat(target[0], target[1], [text_segment(raw)])
                     log("auto-voice segment %d/%d: text fallback (spark_ok=%s)"
                         % (i + 1, len(segs), spark_ok))
-            # 语音回复不发表情（2026-11-09 Torres 定）：触发类图片也不发。
+            # 语音回复也发对应的表情（2026-11-09 Torres 定）：情绪图 + 触发类图片，语音之后单独发。
+            send_voice_images(target, reply, text, persona)
             return True
         # 分段为空（回复是空串）：落回原来的文字流程。
 
@@ -1052,8 +1068,9 @@ def handle_event(event):
         if ref is None:
             ref = tts_to_base64(reply, mom=(persona == "mom"))
         if ref is not None:
-            # 语音回复不发表情（2026-11-09 Torres 定）：触发类图片也不发。
+            # 语音回复也发对应的表情（2026-11-09 Torres 定）。
             send_via_napcat(target[0], target[1], [record_segment(ref)])
+            send_voice_images(target, reply, text, persona)
             return True
         # 合成/发送失败则回文字（继续往下走）。
 
@@ -1080,7 +1097,7 @@ def handle_event(event):
 
 def handle_proactive():
     """小满主动给 Torres 发一条消息（2026-11-09 Torres 定：每天 7 次，想什么时候就什么时候）。
-    只发私聊、只发 Torres 本人、只发语音、只用朋友的克隆音色、不发表情。
+    只发私聊、只发 Torres 本人、只发语音、只用朋友的克隆音色；语音之后发对应的表情包。
     触发脚本调 POST /proactive；本函数自己再守三道门：
     - 距上次主动消息不到 45 分钟，不发；
     - Torres 一小时内刚聊过，不发（别在他正聊着的时候插话）；
@@ -1128,6 +1145,12 @@ def handle_proactive():
             return False
         send_via_napcat(target[0], target[1], [record_segment(ref)])
         log("proactive segment %d/%d: voice sent" % (i + 1, len(segs)))
+    # 主动消息也发对应的表情（2026-11-09 Torres 定：发语音也发对应的表情包）。
+    sticker = maybe_sticker(key, reply, "")
+    if sticker is not None:
+        resp = send_via_napcat(target[0], target[1], [image_segment_file(sticker)])
+        if resp and resp.get("retcode") == 0:
+            mark_sticker_sent(key, sticker)
     _last_proactive_at = now
     history.append({"role": "assistant", "content": reply})
     _history[key] = history[-CFG["history_turns"] * 2:]
@@ -1250,5 +1273,5 @@ if __name__ == "__main__":
                SPARKTTS_MAX_CHARS, SPARKTTS_TIMEOUT_S))
     else:
         log("sparktts off: SPARKTTS_TOKEN / SPARKTTS_DIRECT_URL / SPARKTTS_URL not set, edge-tts only")
-    log("proactive on: POST /proactive (max 7/day, random times 08:00-23:00, voice only, no stickers)")
+    log("proactive on: POST /proactive (max 7/day, random times 08:00-23:00, voice + matching sticker)")
     HTTPServer(("0.0.0.0", CFG["listen_port"]), Handler).serve_forever()
