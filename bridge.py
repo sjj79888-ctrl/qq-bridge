@@ -217,6 +217,8 @@ _sessions = {}          # key -> {"persona": str}
 _history = {}           # key -> [ {"role": "user"/"assistant", "content": str} ]
 _last_sticker_at = {}   # key -> timestamp of last successful sticker send
 _last_sticker_file = {}  # key -> filename of last successful sticker send (2026-11-07: no immediate repeat)
+_last_proactive_at = 0   # 上次主动给 Torres 发消息的时间（2026-11-09：每天 7 次，随机时间）
+_last_inbound_at = {}    # sender(str) -> 上次收到对方私聊消息的时间
 
 
 def session_key(event):
@@ -864,6 +866,8 @@ def handle_event(event):
     text = extract_text(event)
     is_group = event.get("message_type") == "group"
     key = session_key(event)
+    if not is_group:
+        _last_inbound_at[sender] = time.time()
 
     # 1. 黑名单先于白名单检查：不回、不调模型、不发表情。
     if sender in CFG["blacklist"]:
@@ -882,15 +886,8 @@ def handle_event(event):
 
     # 2026-11-07 15:29 Torres 改：图不单独发，跟文字发同一条消息（文字在前、图在后）。
     # legs/趴着触发只选图、不立即发，等文字回复拼到同一条消息里一起发。
+    # 2026-11-09 Torres 定：语音回复不发表情，触发类图片也不发（pending_images 只拼文字回复）。
     pending_images = []
-
-    def send_pending_images(target):
-        """触发类表情（legs/趴着）：只在没有文字可拼时用——语音回复后单独发图。"""
-        for filename in pending_images:
-            resp = send_via_napcat(target[0], target[1],
-                                   [image_segment_file(filename)])
-            if resp and resp.get("retcode") == 0:
-                mark_sticker_sent(key, filename)
 
     # 3. legs 例外：只看大号本人的消息，不看回复文字（见 U20）。
     if sender == CFG["owner_qq"] and LEGS_TRIGGER in text:
@@ -1033,8 +1030,7 @@ def handle_event(event):
                     send_via_napcat(target[0], target[1], [text_segment(raw)])
                     log("auto-voice segment %d/%d: text fallback (spark_ok=%s)"
                         % (i + 1, len(segs), spark_ok))
-            # 语音回复不发表情；触发类图片（legs/趴着）照旧单独发。
-            send_pending_images(target)
+            # 语音回复不发表情（2026-11-09 Torres 定）：触发类图片也不发。
             return True
         # 分段为空（回复是空串）：落回原来的文字流程。
 
@@ -1056,9 +1052,8 @@ def handle_event(event):
         if ref is None:
             ref = tts_to_base64(reply, mom=(persona == "mom"))
         if ref is not None:
-            # 语音回复不发表情。
+            # 语音回复不发表情（2026-11-09 Torres 定）：触发类图片也不发。
             send_via_napcat(target[0], target[1], [record_segment(ref)])
-            send_pending_images(target)
             return True
         # 合成/发送失败则回文字（继续往下走）。
 
@@ -1078,6 +1073,64 @@ def handle_event(event):
     if resp and resp.get("retcode") == 0:
         for filename in sent_files:
             mark_sticker_sent(key, filename)
+    return True
+
+
+# --------------------------------------------------------------- proactive --
+
+def handle_proactive():
+    """小满主动给 Torres 发一条消息（2026-11-09 Torres 定：每天 7 次，想什么时候就什么时候）。
+    只发私聊、只发 Torres 本人、只发语音、只用朋友的克隆音色、不发表情。
+    触发脚本调 POST /proactive；本函数自己再守三道门：
+    - 距上次主动消息不到 45 分钟，不发；
+    - Torres 一小时内刚聊过，不发（别在他正聊着的时候插话）；
+    - 当前人格不是小满（妈妈/女仆），不发。
+    克隆语音不可用时不发（不回落 edge-tts，不发文字），宁可错过一次。
+    返回 True 表示发出去了。"""
+    global _last_proactive_at
+    now = time.time()
+    if now - _last_proactive_at < 45 * 60:
+        log("proactive: skipped, too soon after last proactive")
+        return False
+    if now - _last_inbound_at.get(CFG["owner_qq"], 0) < 60 * 60:
+        log("proactive: skipped, Torres chatted recently")
+        return False
+    # Torres 私聊会话键：user_id 在事件里是数字，先按数字找，找不到再按字符串找。
+    key = (None, int(CFG["owner_qq"]))
+    if key not in _history:
+        key = (None, CFG["owner_qq"])
+    if get_persona(key) != "xiaoman":
+        log("proactive: skipped, persona is not xiaoman")
+        return False
+    _sys = SYSTEM_PROMPT + "\n" + IDENTITY_OWNER + "\n" + AUTONOMY_PROMPT
+    history = _history.get(key, [])
+    messages = [{"role": "system", "content": _sys}]
+    messages += history[-6:]
+    messages.append({"role": "user", "content": "你现在主动给 Torres 发一条消息，自然地开启话题。可以是想他了、看到楼下那只猫、想起花店的事、问他在干嘛、分享一件小事。只发一句话，不超过20字，语气像你平时说话。不要提你是被叫来发消息的，也不要说“我是来找你的”这种话。"})
+    reply = llm_reply(messages)
+    if not reply:
+        log("proactive: LLM failed, skipped")
+        return False
+    segs = split_reply_for_voice(reply)
+    if not segs:
+        log("proactive: empty reply, skipped")
+        return False
+    target = ("private", CFG["owner_qq"])
+    for i, (raw, speak, spark_ok) in enumerate(segs):
+        if i > 0:
+            time.sleep(AUTO_VOICE_GAP_S)
+        if not speak or not spark_ok:
+            log("proactive: segment not speakable, abort")
+            return False
+        ref = sparktts_to_base64(speak)
+        if ref is None:
+            log("proactive: sparktts failed, skipped (no fallback)")
+            return False
+        send_via_napcat(target[0], target[1], [record_segment(ref)])
+        log("proactive segment %d/%d: voice sent" % (i + 1, len(segs)))
+    _last_proactive_at = now
+    history.append({"role": "assistant", "content": reply})
+    _history[key] = history[-CFG["history_turns"] * 2:]
     return True
 
 
@@ -1128,6 +1181,20 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.settimeout(None)
 
     def do_POST(self):
+        if self.path == "/proactive":
+            # 主动找 Torres 聊天：处理要几分钟（LLM + 语音合成），调用方不等回包。
+            try:
+                handle_proactive()
+            except Exception as e:
+                log("proactive handler error:", repr(e))
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+            except Exception:
+                pass
+            return
         if self.path != "/event":
             self.send_response(404)
             self.end_headers()
@@ -1183,4 +1250,5 @@ if __name__ == "__main__":
                SPARKTTS_MAX_CHARS, SPARKTTS_TIMEOUT_S))
     else:
         log("sparktts off: SPARKTTS_TOKEN / SPARKTTS_DIRECT_URL / SPARKTTS_URL not set, edge-tts only")
+    log("proactive on: POST /proactive (max 7/day, random times 08:00-23:00, voice only, no stickers)")
     HTTPServer(("0.0.0.0", CFG["listen_port"]), Handler).serve_forever()
